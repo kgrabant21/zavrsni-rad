@@ -1,0 +1,248 @@
+#include <WiFi.h>
+#include <LedControl.h>
+#include <DHT.h>
+#include <HTTPClient.h>
+
+// Wi-Fi podaci
+const char* wifiMreza = "nazivMreze";
+const char* wifiLozinka = "lozinkaMreze";
+
+WiFiClient klijent;
+HTTPClient http;
+
+// API podaci za ThingSpeak
+String apiKey = "api_kljuc";  
+String server = "http://api.thingspeak.com/update";
+
+//  Senzori
+DHT dht(26, DHT11); // DHT11 senzor spojen na GPIO 26
+
+const int pinProzor1 = 35; // reed senzor prozor 1
+const int pinProzor2 = 34; // reed senzor prozor 2
+
+// Tipke
+const int pinUkljuciIskljuci = 14; // tipka za uključivanje/isključivanje
+bool stanjeUkljuciIskljuci = true;
+bool zadnjeStanjeTipkala = LOW;
+
+const int pinPromjenaNacina = 25;  // tipka za promjenu načina rada (Grijanje/Hlađenje)
+bool stanjeNacinRada = false;
+bool zadnjeStanjeNacina = HIGH;
+
+// LED diode
+const int pinLedUkljucenost = 12;  // LED dioda – sustav uključen/isključen
+const int pinLedUredaj = 27;       // LED dioda – radi li uređaj
+bool stanjeUredaja = false;
+
+// Potenciometri
+const int pinZadanaTemperatura = 33; 
+const int pinGranica = 32;
+
+// LED zaslon (MAX7219)
+LedControl zaslon = LedControl(23, 18, 5, 1); // DIN=23, CLK=18, CS=5
+
+// Varijable za praćenje
+int zadnjeStanjeProzor1 = -1;
+int zadnjeStanjeProzor2 = -1;
+unsigned long vrijemePromjeneProzor1 = 0;
+unsigned long vrijemePromjeneProzor2 = 0;
+
+// Pomoćne funkcije
+void prikaziDvoznamenkasti(int vrijednost, int pozicija) {
+  zaslon.setDigit(0, pozicija,   vrijednost / 10, false); 
+  zaslon.setDigit(0, pozicija-1, vrijednost % 10, true); 
+}
+
+double stabilnoCitanjeAnalogno(int pin) {
+  analogRead(pin);
+  long zbroj = 0;
+  for (int i = 0; i < 10; i++) {
+    zbroj += analogRead(pin);
+    delay(2);
+  }
+  return zbroj / 10;
+}
+
+// Funkcija za slanje podataka na ThingSpeak
+void posaljiNaThingSpeak(float temperatura,
+                         float vlaga,
+                         int prozor1,
+                         int prozor2,
+                         unsigned long trajanje1,
+                         unsigned long trajanje2,
+                         int uredaj,
+                         int nacin) {
+  if (WiFi.status() == WL_CONNECTED) {
+    String url = server + "?api_key=" + apiKey +
+      "&field1=" + String(temperatura, 2) +
+      "&field2=" + String(vlaga, 2) +
+      "&field3=" + String(prozor1) +
+      "&field4=" + String(prozor2) +
+      "&field5=" + String(trajanje1) +
+      "&field6=" + String(trajanje2) +
+      "&field7=" + String(uredaj) +
+      "&field8=" + String(nacin);
+
+    http.begin(url);
+    int httpCode = http.GET();
+    Serial.print("ThingSpeak odgovor: ");
+    Serial.println(httpCode);
+    http.end();
+  } else {
+    Serial.println("Wi-Fi nije povezan, podaci nisu poslani.");
+  }
+}
+
+// Setup
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Pokretanje ESP32 sustava...");
+
+  // Povezivanje na Wi-Fi
+  WiFi.begin(wifiMreza, wifiLozinka);
+  Serial.print("Povezivanje na Wi-Fi");
+
+  unsigned long pocetak = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - pocetak < 10000) {
+    Serial.print(".");
+    delay(200);
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Uspješno povezano na mrežu!");
+  } else {
+    Serial.println("Povezivanje nije uspjelo! Sustav radi offline.");
+  }
+
+  // Inicijalizacija senzora i pinova
+  dht.begin();
+
+  pinMode(pinUkljuciIskljuci, INPUT_PULLUP);
+  pinMode(pinPromjenaNacina, INPUT_PULLUP);
+
+  pinMode(pinLedUkljucenost, OUTPUT);
+  pinMode(pinLedUredaj, OUTPUT);
+
+  pinMode(pinProzor1, INPUT);
+  pinMode(pinProzor2, INPUT);
+
+  zadnjeStanjeProzor1 = digitalRead(pinProzor1);
+  zadnjeStanjeProzor2 = digitalRead(pinProzor2);
+  vrijemePromjeneProzor1 = millis();
+  vrijemePromjeneProzor2 = millis();
+
+  // Inicijalizacija LED zaslona
+  zaslon.shutdown(0, false);
+  zaslon.setIntensity(0, 7); // svjetlina 0–15
+  zaslon.clearDisplay(0);
+
+  delay(1000);
+}
+
+// Glavna petlja
+void loop() {
+  // Očitavanje reed senzora
+  int stanjeProzor1 = digitalRead(pinProzor1);
+  int stanjeProzor2 = digitalRead(pinProzor2);
+
+  if (stanjeProzor1 != zadnjeStanjeProzor1) {
+    zadnjeStanjeProzor1 = stanjeProzor1;
+    vrijemePromjeneProzor1 = millis();
+  }
+  if (stanjeProzor2 != zadnjeStanjeProzor2) {
+    zadnjeStanjeProzor2 = stanjeProzor2;
+    vrijemePromjeneProzor2 = millis();
+  }
+
+  // Očitavanje temperature i vlage
+  float trenutnaTemperatura = dht.readTemperature();
+  float trenutnaVlaga = dht.readHumidity();
+
+  // Tipkalo za uključivanje/isključivanje
+  bool trenutnoStanjeTipkala = digitalRead(pinUkljuciIskljuci);
+  if (zadnjeStanjeTipkala == HIGH && trenutnoStanjeTipkala == LOW) {
+    stanjeUkljuciIskljuci = !stanjeUkljuciIskljuci;
+    delay(200);
+  }
+  zadnjeStanjeTipkala = trenutnoStanjeTipkala;
+
+  digitalWrite(pinLedUkljucenost, stanjeUkljuciIskljuci ? HIGH : LOW);
+
+  // Ako je sustav uključen
+  if (stanjeUkljuciIskljuci) {
+    // Tipkalo za promjenu načina rada
+    bool trenutnoStanjeNacina = digitalRead(pinPromjenaNacina);
+    if (zadnjeStanjeNacina == HIGH && trenutnoStanjeNacina == LOW) {
+      stanjeNacinRada = !stanjeNacinRada;
+      delay(200);
+    }
+    zadnjeStanjeNacina = trenutnoStanjeNacina;
+
+    float zadanaTemperatura = map(stabilnoCitanjeAnalogno(pinZadanaTemperatura), 0, 4095, 16, 32);
+    float granica = map(stabilnoCitanjeAnalogno(pinGranica), 0, 4095, 0, 9);
+
+    // Logika grijanja/hlađenja
+    if (stanjeProzor1 == HIGH || stanjeProzor2 == HIGH) {
+      stanjeUredaja = false;
+    } else {
+      if (stanjeNacinRada) { // Hlađenje
+        stanjeUredaja = (trenutnaTemperatura >= (zadanaTemperatura + granica));
+        if (trenutnaTemperatura <= zadanaTemperatura) {
+          stanjeUredaja = false;
+        }
+      } else { // Grijanje
+        stanjeUredaja = (trenutnaTemperatura <= (zadanaTemperatura - granica));
+        if (trenutnaTemperatura >= zadanaTemperatura) {
+          stanjeUredaja = false;
+        }
+      }
+    }
+
+    // Prikaz na zaslonu
+    prikaziDvoznamenkasti(round(trenutnaTemperatura), 7);
+    prikaziDvoznamenkasti(round(trenutnaVlaga), 5);
+    prikaziDvoznamenkasti(zadanaTemperatura, 3);
+    zaslon.setDigit(0, 1, granica, true);
+    zaslon.setChar(0, 0, stanjeNacinRada ? 'C' : 'H', true);
+
+    // Upravljanje LED diodom uređaja
+    digitalWrite(pinLedUredaj, stanjeUredaja ? HIGH : LOW);
+
+  } else {
+    // Ako je sustav isključen -> prikaz samo temp/vlaga
+    digitalWrite(pinLedUredaj, LOW);
+
+    int tempCijeli = floor(trenutnaTemperatura);
+    int tempDec = (trenutnaTemperatura - tempCijeli) * 100;
+    int vlagaCijeli = floor(trenutnaVlaga);
+    int vlagaDec = (trenutnaVlaga - vlagaCijeli) * 100;
+
+    prikaziDvoznamenkasti(tempCijeli, 7);
+    prikaziDvoznamenkasti(tempDec, 5);
+    prikaziDvoznamenkasti(vlagaCijeli, 3);
+    prikaziDvoznamenkasti(vlagaDec, 1);
+  }
+  
+  // Slanje podataka na ThingSpeak svake 20 sekunde
+  static unsigned long zadnjeSlanje = 0;
+  if (millis() - zadnjeSlanje > 20000) {
+    unsigned long trajanje1 = (millis() - vrijemePromjeneProzor1) / 60000UL;
+    unsigned long trajanje2 = (millis() - vrijemePromjeneProzor2) / 60000UL;
+
+    posaljiNaThingSpeak(
+      trenutnaTemperatura,
+      trenutnaVlaga,
+      stanjeProzor1 == LOW ? 1 : 0,
+      stanjeProzor2 == LOW ? 1 : 0,
+      trajanje1,
+      trajanje2,
+      stanjeUredaja ? 1 : 0,
+      stanjeNacinRada ? 1 : 0
+    );
+    zadnjeSlanje = millis();
+  }
+
+  delay(100);
+}
